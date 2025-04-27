@@ -72,32 +72,47 @@ class CharacterConditionedUNet(UNetModel):
     def forward(self, t, x, char_indices=None, *args, **kwargs):
         """
         Forward pass with character sequence conditioning via channel concatenation.
-        
+        Conditioning is spatially distributed across the width.
+
         Args:
             t: Time step [B]
             x: Input image tensor [B, C_img, H, W]
             char_indices: Character indices tensor [B, L] where L is sequence length
         """
         B, C_img_actual, H, W = x.shape
-        
-        if C_img_actual != (self.in_channels - self.cond_channels):
+
+        # Calculate expected image channels based on total_in_channels and cond_channels
+        expected_img_channels = self.in_channels - self.cond_channels
+        if C_img_actual != expected_img_channels:
              raise ValueError(
                  f"Input image channels ({C_img_actual}) do not match "
-                 f"model's expected image channels ({self.in_channels - self.cond_channels})"
+                 f"model's expected image channels ({expected_img_channels})"
              )
 
         # Create conditioning tensor
         if char_indices is None:
+            # Use zero conditioning if no character indices are provided
             cond = torch.zeros(B, self.cond_channels, H, W, device=x.device, dtype=x.dtype)
         else:
-            char_emb = self.char_embedding(char_indices)  # [B, L, embed_dim]
-            char_emb_pooled = char_emb.mean(dim=1)      # [B, embed_dim]
-            cond = char_emb_pooled[:, :, None, None]    # [B, cond_channels, 1, 1]
-            cond = cond.repeat(1, 1, H, W)              # [B, cond_channels, H, W]
+            # 1. Get character embeddings
+            char_emb = self.char_embedding(char_indices)  # Shape: [B, L, E]
+            E = char_emb.shape[-1] # Get embed_dim (self.cond_channels)
 
-        # Concatenate conditioning tensor to the image tensor
-        conditioned_x = torch.cat([x, cond], dim=1) # [B, C_img + cond_channels, H, W]
-        
+            # 2. Spatially distribute embeddings across width W
+            # Permute to [B, E, L] for interpolation
+            char_emb_permuted = char_emb.permute(0, 2, 1)
+
+            # Interpolate the L dimension to match width W
+            # Using nearest neighbor interpolation maintains discrete character signals
+            cond_interp = F.interpolate(char_emb_permuted, size=W, mode='nearest') # Shape: [B, E, W]
+
+            # 3. Broadcast across height H
+            # Add height dimension and repeat/expand
+            cond = cond_interp.unsqueeze(2).expand(-1, -1, H, -1) # Shape: [B, E, H, W]
+
+        # Concatenate conditioning tensor to the image tensor along the channel dimension
+        conditioned_x = torch.cat([x, cond], dim=1) # Shape: [B, C_img + E, H, W]
+
         # Call the base UNetModel's forward pass directly
         # Base forward expects (t, x, y=None), where x is the full input
         return super().forward(t, conditioned_x, y=None) 
