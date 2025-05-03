@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 from absl import app, flags
 from PIL import Image
 import numpy as np
+import copy
 
 from iam_dataset import IAMWordDataset
 from transforms import StandardizeAspectRatio
@@ -56,8 +57,13 @@ flags.DEFINE_integer("image_width", 128, help="image width")
 flags.DEFINE_integer("save_step", 2000, help="frequency of saving checkpoints")
 flags.DEFINE_integer("eval_step", 1000, help="frequency of evaluation")
 flags.DEFINE_integer("num_samples", 16, help="number of samples to generate during evaluation")
+flags.DEFINE_integer("num_inference_steps", 50, help="number of steps for inference")
 
+# GPU selection parameter
+flags.DEFINE_integer("gpu", 0, help="GPU ID to use (0 for first GPU, 1 for second GPU, etc.)")
 
+# Create FM variable but initialize it in train function
+FM = None
 
 def ema(model, ema_model, decay):
     """Update EMA model parameters."""
@@ -70,70 +76,55 @@ def warmup_lr(step):
     return min(step, FLAGS.warmup) / FLAGS.warmup
 
 def generate_samples(model, dataset, device, num_samples, savedir, step, net_="normal"):
-    """Generate and save samples from the model using ODE integration."""
+    """Generate and save samples from the model."""
     model.eval()
     with torch.no_grad():
-        # Sample random words from the dataset for conditioning
+        # Sample random words from the dataset
         indices = torch.randint(0, len(dataset), (num_samples,))
-        char_list = []
+        char_indices = []
         for idx in indices:
-            _, text = dataset[idx] # Assuming dataset returns image, text_indices
-            char_list.append(text)
+            _, text = dataset[idx]
+            char_indices.append(text)
         
         # Pad character sequences to the same length
-        # Note: Ensure padding matches training if applicable
-        max_len = max(len(text) for text in char_list)
+        max_len = max(len(text) for text in char_indices)
         padded_indices = torch.zeros((num_samples, max_len), dtype=torch.long)
-        for i, text in enumerate(char_list):
+        for i, text in enumerate(char_indices):
             padded_indices[i, :len(text)] = text
         
-        # Move conditioning to device
+        # Move to device
         char_indices = padded_indices.to(device)
         
-        # Start from Gaussian noise (t=1)
-        z = torch.randn(num_samples, 1, FLAGS.image_height, FLAGS.image_width).to(device)
+        # Generate samples
+        x0 = torch.randn(num_samples, FLAGS.image_channels, FLAGS.image_height, FLAGS.image_width).to(device)
         
-        # Define the drift function (vector field) using the model
-        # It needs to accept (t, x) and use the conditioning
-        def drift(t, x):
-            # Expand t to match batch size if necessary
-            if t.numel() == 1:
-                t = t.repeat(x.shape[0])
-            # model expects (t, x, condition)
-            return model(t, x, char_indices)
-
-        # Integrate from t=1 to t=0
-        integration_times = torch.linspace(1.0, 0.0, 100).to(device) # Example: 100 steps
+        # Generate samples
+        samples = []
+        for i in range(num_samples):
+            # Start with noise and set initial timestep to t=1
+            t = torch.ones(1, 1).to(device)
+            xt = x0[i:i+1].clone()
+            
+            # Integrate the flow with multiple steps
+            dt = 1.0 / FLAGS.num_inference_steps
+            for j in range(FLAGS.num_inference_steps):
+                t_j = t * (1.0 - j * dt)
+                vt = model(t_j, xt, char_indices[i:i+1])
+                xt = xt + vt * dt
+            
+            samples.append(xt)
         
-        # Use odeint to solve the ODE
-        # Need to wrap drift to match odeint's expected signature if necessary
-        # odeint expects func(t, y), where y is the state (our x)
-        # Our drift function already matches this signature
-        generated_samples = odeint(
-            drift, 
-            z, 
-            integration_times,
-            method='rk4', # Example solver, 'dopri5' is another option
-            atol=1e-5, 
-            rtol=1e-5
-        )[-1] # Get the state at the last time step (t=0)
-
+        # Stack samples
+        samples = torch.cat(samples, dim=0)
+        
         # Denormalize
-        generated_samples = (generated_samples + 1) / 2
-        generated_samples = torch.clamp(generated_samples, 0.0, 1.0) # Clamp to [0, 1]
+        samples = (samples + 1) / 2
         
         # Save samples
         os.makedirs(savedir, exist_ok=True)
         for i in range(num_samples):
             plt.figure(figsize=(4, 1))
-            # Decode characters for title (optional)
-            try:
-                chars = "".join([dataset.idx_to_char[idx.item()] for idx in char_list[i] if idx.item() in dataset.idx_to_char])
-            except AttributeError: # Handle case where idx_to_char might not exist directly
-                chars = "unknown"
-                
-            plt.imshow(generated_samples[i].squeeze().cpu().numpy(), cmap='gray')
-            plt.title(f'{chars}')
+            plt.imshow(samples[i].squeeze().cpu().numpy(), cmap='gray')
             plt.axis('off')
             plt.savefig(os.path.join(savedir, f"sample_{step}_{i}_{net_}.png"))
             plt.close()
@@ -142,6 +133,14 @@ def generate_samples(model, dataset, device, num_samples, savedir, step, net_="n
 
 def train(argv):
     """Train the handwriting generation model."""
+    global FM
+    
+    # Initialize FM after flags are parsed
+    if FLAGS.model == "otcfm":
+        FM = ExactOptimalTransportConditionalFlowMatcher(sigma=0.0)
+    else:
+        FM = ConditionalFlowMatcher(sigma=0.0)
+    
     print(
         "lr, total_steps, ema decay, save_step:",
         FLAGS.lr,
@@ -150,9 +149,14 @@ def train(argv):
         FLAGS.save_step,
     )
     
-    # Set device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Set GPU device - add this to select the GPU
+    # os.environ["CUDA_VISIBLE_DEVICES"] = str(FLAGS.gpu)
+    # os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    print(f"Using GPU: {FLAGS.gpu}")
     
+    # Set device
+    device = torch.device(f"cuda:{FLAGS.gpu}" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
     # Create dataset and dataloader
     transform = transforms.Compose([
         StandardizeAspectRatio(2.0),  # Standardize aspect ratio to 2:1
@@ -207,37 +211,12 @@ def train(argv):
         # use_new_attention_order=False, # Default in UNetModel
     ).to(device)
     
-    # Create EMA model - using same parameters
-    ema_model = CharacterConditionedUNet(
-        image_size=FLAGS.image_width, 
-        image_channels=FLAGS.image_channels,
-        model_channels=FLAGS.model_channels,
-        num_res_blocks=FLAGS.num_res_blocks,
-        channel_mult=FLAGS.channel_mult,
-        embed_dim=FLAGS.embed_dim, 
-        vocab_size=len(dataset.char_to_idx),
-        attention_resolutions=attention_resolutions_int, 
-        dropout=FLAGS.dropout,
-        learn_sigma=False,
-        use_checkpoint=False,
-        use_scale_shift_norm=False,
-        resblock_updown=False,
-        use_fp16=False,
-        num_heads=FLAGS.num_heads,
-        num_head_channels=FLAGS.num_head_channels,
-    ).to(device)
-    
-    ema_model.load_state_dict(model.state_dict())
+    # Use copy.deepcopy like in CIFAR10
+    ema_model = copy.deepcopy(model)
     
     # Create optimizer and scheduler
     optimizer = optim.Adam(model.parameters(), lr=FLAGS.lr)
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=warmup_lr)
-    
-    # Create flow matcher
-    if FLAGS.model == "otcfm":
-        fm = ExactOptimalTransportConditionalFlowMatcher(sigma=0.0)
-    else:
-        fm = ConditionalFlowMatcher(sigma=0.0)
     
     # Training loop
     savedir = f"results/{FLAGS.model}/"
@@ -257,7 +236,7 @@ def train(argv):
                 
                 # Sample noise and time
                 x0 = torch.randn_like(images)
-                t, xt, ut = fm.sample_location_and_conditional_flow(x0, images)
+                t, xt, ut = FM.sample_location_and_conditional_flow(x0, images)
                 
                 # Forward pass
                 vt = model(t, xt, char_indices)
@@ -295,6 +274,14 @@ def train(argv):
                         },
                         os.path.join(savedir, f"{FLAGS.model}_handwriting_weights_step_{step}.pt"),
                     )
+                
+                # Add before sampling
+                # params_equal = True
+                # for p1, p2 in zip(model.parameters(), ema_model.parameters()):
+                #     if not torch.allclose(p1, p2, rtol=1e-3):
+                #         params_equal = False
+                #         break
+                # print(f"Model and EMA parameters identical: {params_equal}")
                 
                 step += 1
 

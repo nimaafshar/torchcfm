@@ -18,23 +18,30 @@ FLAGS = flags.FLAGS
 
 # Model parameters
 flags.DEFINE_string("model", "otcfm", help="flow matching model type")
-flags.DEFINE_integer("num_channels", 128, help="base channel of UNet")
+flags.DEFINE_integer("model_channels", 128, help="base channel dimension of UNet")
+flags.DEFINE_integer("image_channels", 1, help="Number of channels in the input image")
 flags.DEFINE_integer("num_res_blocks", 2, help="number of residual blocks")
 flags.DEFINE_list("channel_mult", [1, 2, 2, 2], help="channel multiplier")
 flags.DEFINE_integer("num_heads", 4, help="number of attention heads")
 flags.DEFINE_integer("num_head_channels", 64, help="number of channels per attention head")
 flags.DEFINE_float("dropout", 0.1, help="dropout rate")
 flags.DEFINE_integer("embed_dim", 64, help="character embedding dimension")
+flags.DEFINE_string("attention_resolutions", "16", help="UNet attention resolutions")
 
 # Generation parameters
 flags.DEFINE_string("checkpoint", "", help="path to model checkpoint")
 flags.DEFINE_string("data_dir", "~/datasets/IAM", help="IAM dataset directory")
-flags.DEFINE_integer("image_size", 32, help="image height")
+flags.DEFINE_integer("image_height", 64, help="image height")
 flags.DEFINE_integer("image_width", 128, help="image width")
 flags.DEFINE_integer("num_samples", 16, help="number of samples to generate")
 flags.DEFINE_string("output_dir", "results/generated", help="output directory")
 flags.DEFINE_string("text", "", help="text to generate (if empty, will use random words from dataset)")
 flags.DEFINE_integer("num_inference_steps", 50, help="number of inference steps")
+flags.DEFINE_integer("max_word_length", 6, help="maximum word length")
+flags.DEFINE_integer("min_word_length", 4, help="minimum word length")
+
+# Create FM variable but initialize it later
+FM = None
 
 def encode_text(text, dataset):
     """Encode text to character indices."""
@@ -43,7 +50,11 @@ def encode_text(text, dataset):
         if char in dataset.char_to_idx:
             indices.append(dataset.char_to_idx[char])
         else:
-            indices.append(dataset.char_to_idx[''])
+            # Use a fallback character (space or the first character in the vocab)
+            if ' ' in dataset.char_to_idx:
+                indices.append(dataset.char_to_idx[' '])
+            else:
+                indices.append(0)  # First character as fallback
     return torch.tensor(indices, dtype=torch.long)
 
 def generate_samples(model, dataset, device, text=None, num_samples=1):
@@ -54,6 +65,7 @@ def generate_samples(model, dataset, device, text=None, num_samples=1):
             # Encode the provided text
             char_indices = encode_text(text, dataset)
             char_indices = char_indices.unsqueeze(0).repeat(num_samples, 1).to(device)
+            texts = [text] * num_samples
         else:
             # Sample random words from the dataset
             indices = torch.randint(0, len(dataset), (num_samples,))
@@ -74,21 +86,16 @@ def generate_samples(model, dataset, device, text=None, num_samples=1):
             char_indices = padded_indices.to(device)
         
         # Generate samples
-        x0 = torch.randn(num_samples, 1, FLAGS.image_size, FLAGS.image_width).to(device)
+        x0 = torch.randn(num_samples, FLAGS.image_channels, FLAGS.image_height, FLAGS.image_width).to(device)
         
-        # Sample from the model
-        if FLAGS.model == "otcfm":
-            fm = ExactOptimalTransportConditionalFlowMatcher(sigma=0.0)
-        else:
-            fm = ConditionalFlowMatcher(sigma=0.0)
-        
-        # Generate samples
+        # Generate samples exactly as in train_handwriting.py
         samples = []
         for i in range(num_samples):
-            # Sample a single image
-            t, xt, ut = fm.sample_location_and_conditional_flow(x0[i:i+1], None)
+            # Sample a single image with t=1 (initial timestep)
+            t = torch.ones(1, 1).to(device)
+            xt = x0[i:i+1].clone()
             
-            # Integrate the flow with multiple steps
+            # Integrate the flow with multiple steps (like in train_handwriting.py)
             dt = 1.0 / FLAGS.num_inference_steps
             for j in range(FLAGS.num_inference_steps):
                 t_j = t * (1.0 - j * dt)
@@ -103,33 +110,81 @@ def generate_samples(model, dataset, device, text=None, num_samples=1):
         # Denormalize
         samples = (samples + 1) / 2
         
-        return samples, texts if not text else [text] * num_samples
+        return samples, texts
+
+def load_vocab_from_checkpoint(checkpoint_path, device):
+    """Extract vocabulary size from the checkpoint."""
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if "ema_model" in checkpoint:
+        state_dict = checkpoint["ema_model"]
+    else:
+        state_dict = checkpoint["model"]
+    
+    # Get vocabulary size from char_embedding weight shape
+    if "char_embedding.embedding.weight" in state_dict:
+        vocab_size = state_dict["char_embedding.embedding.weight"].shape[0]
+        return vocab_size
+    return None
 
 def main(argv):
     """Generate handwriting samples from a trained model."""
+    global FM
+    
+    # Initialize FM after flags are parsed
+    if FLAGS.model == "otcfm":
+        FM = ExactOptimalTransportConditionalFlowMatcher(sigma=0.0)
+    else:
+        FM = ConditionalFlowMatcher(sigma=0.0)
+    
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Create dataset
+    # Create dataset with the exact parameters from training
+    # These values must match what was used during training
     dataset = IAMWordDataset(
         root_dir=FLAGS.data_dir,
         split='train',
         transform=None,
-        max_word_length=32,
-        min_word_length=1,
+        max_word_length=FLAGS.max_word_length,  # Use the same max_word_length as training
+        min_word_length=FLAGS.min_word_length,  # Use the same min_word_length as training
     )
+    
+    # Parse attention_resolutions from string flag to tuple of ints
+    try:
+        attention_resolutions_int = tuple(int(res) for res in FLAGS.attention_resolutions.split(",") if res)
+    except ValueError:
+        print(f"Warning: Invalid attention_resolutions string '{FLAGS.attention_resolutions}'. Using empty tuple.")
+        attention_resolutions_int = tuple()
+    
+    # Check if we need to extract vocab size from checkpoint
+    vocab_size = None
+    if FLAGS.checkpoint:
+        vocab_size = load_vocab_from_checkpoint(FLAGS.checkpoint, device)
+    
+    if vocab_size is None:
+        vocab_size = len(dataset.char_to_idx)
+        print(f"Using dataset vocabulary size: {vocab_size}")
+    else:
+        print(f"Using checkpoint vocabulary size: {vocab_size}")
     
     # Create model
     model = CharacterConditionedUNet(
-        dim=(1, FLAGS.image_size, FLAGS.image_width),
-        num_channels=FLAGS.num_channels,
+        image_size=FLAGS.image_width, 
+        image_channels=FLAGS.image_channels, 
+        model_channels=FLAGS.model_channels,
         num_res_blocks=FLAGS.num_res_blocks,
-        channel_mult=[int(x) for x in FLAGS.channel_mult],
+        channel_mult=FLAGS.channel_mult,
+        embed_dim=FLAGS.embed_dim, 
+        vocab_size=vocab_size,  # Use the vocabulary size from the checkpoint
+        attention_resolutions=attention_resolutions_int,
+        dropout=FLAGS.dropout,
+        learn_sigma=False,
+        use_checkpoint=False,
+        use_scale_shift_norm=False,
+        resblock_updown=False,
+        use_fp16=False,
         num_heads=FLAGS.num_heads,
         num_head_channels=FLAGS.num_head_channels,
-        dropout=FLAGS.dropout,
-        vocab_size=len(dataset.char_to_idx),
-        embed_dim=FLAGS.embed_dim,
     ).to(device)
     
     # Load checkpoint
@@ -137,9 +192,10 @@ def main(argv):
         checkpoint = torch.load(FLAGS.checkpoint, map_location=device)
         if "ema_model" in checkpoint:
             model.load_state_dict(checkpoint["ema_model"])
+            print(f"Loaded EMA model from {FLAGS.checkpoint}")
         else:
             model.load_state_dict(checkpoint["model"])
-        print(f"Loaded checkpoint from {FLAGS.checkpoint}")
+            print(f"Loaded model from {FLAGS.checkpoint}")
     else:
         print("No checkpoint provided. Using randomly initialized model.")
     
