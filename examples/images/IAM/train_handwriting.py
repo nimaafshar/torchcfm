@@ -50,9 +50,11 @@ flags.DEFINE_float("lr", 2e-4, help="learning rate")
 flags.DEFINE_float("grad_clip", 1.0, help="gradient norm clipping")
 flags.DEFINE_integer("total_steps", 10000, help="total training steps")
 flags.DEFINE_integer("warmup", 2000, help="learning rate warmup")
-flags.DEFINE_float("lr_decay_rate", 0.8, help="learning rate decay rate (applied every lr_decay_steps)")
-flags.DEFINE_integer("lr_decay_steps", 1000, help="number of steps between learning rate decay")
+flags.DEFINE_float("lr_decay_rate", 0.9, help="learning rate decay rate (applied every lr_decay_steps)")
+flags.DEFINE_integer("lr_decay_steps", 2000, help="number of steps between learning rate decay")
 flags.DEFINE_float("min_lr", 1e-6, help="minimum learning rate")
+flags.DEFINE_float("l2_reg_weight", 0.001, help="weight for L2 regularization of velocity field")
+flags.DEFINE_boolean("use_weighted_loss", True, help="whether to use weighted loss based on time")
 flags.DEFINE_integer("batch_size", 32, help="batch size")
 flags.DEFINE_integer("num_workers", 4, help="workers of Dataloader")
 flags.DEFINE_float("ema_decay", 0.9999, help="ema decay rate")
@@ -133,8 +135,8 @@ def calculate_metrics(real_images, generated_images, device):
         generated_images_uint8 = generated_images_uint8.repeat(1, 3, 1, 1)
     
     # Initialize metrics with smaller subset size
-    fid = FrechetInceptionDistance(feature=64, normalize=True, subset_size=subset_size).to(device)
-    kid = KernelInceptionDistance(feature=64, normalize=True, subset_size=subset_size).to(device)
+    fid = FrechetInceptionDistance(feature=64, normalize=True).to(device)
+    kid = KernelInceptionDistance(feature=64, normalize=True).to(device)
     
     # Update metrics with real and fake images
     fid.update(real_images_uint8, real=True)
@@ -334,6 +336,12 @@ def train(argv):
         FLAGS.save_step,
     )
     
+    print(
+        "Loss config - L2 reg weight: {}, Use weighted loss: {}".format(
+            FLAGS.l2_reg_weight, FLAGS.use_weighted_loss
+        )
+    )
+    
     # Set GPU device - add this to select the GPU
     # os.environ["CUDA_VISIBLE_DEVICES"] = str(FLAGS.gpu)
     # os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -373,6 +381,9 @@ def train(argv):
         "min_word_length": FLAGS.min_word_length,
         "image_height": FLAGS.image_height,
         "image_width": FLAGS.image_width,
+        "l2_reg_weight": FLAGS.l2_reg_weight,
+        "use_weighted_loss": FLAGS.use_weighted_loss,
+        "grad_clip": FLAGS.grad_clip,
     }
     
     # Save config to TensorBoard log directory and results directory
@@ -472,13 +483,33 @@ def train(argv):
                 # Forward pass
                 vt = model(t, xt, char_indices)
                 
-                # Compute loss
-                loss = torch.mean((vt - ut) ** 2)
+                # Compute loss with regularization
+                # Basic MSE loss
+                mse_loss = torch.mean((vt - ut) ** 2)
+                
+                # Add L2 regularization for the velocity field
+                l2_reg = torch.mean(vt**2) * FLAGS.l2_reg_weight
+                
+                # Add per-sample loss normalization if enabled
+                weighted_mse = 0.0
+                if FLAGS.use_weighted_loss:
+                    batch_weights = 1.0 / (torch.sum(t * (1-t), dim=1) + 1e-5)
+                    batch_weights = batch_weights / batch_weights.mean()
+                    weighted_mse = torch.mean(batch_weights * torch.mean((vt - ut) ** 2, dim=[1,2,3]))
+                    loss = weighted_mse + l2_reg
+                else:
+                    loss = mse_loss + l2_reg
                 
                 # Backward pass
                 optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), FLAGS.grad_clip)
+                
+                # Advanced gradient clipping per parameter
+                # This helps with training stability for complex models
+                for param in model.parameters():
+                    if param.grad is not None:
+                        param.grad.data.clamp_(-FLAGS.grad_clip, FLAGS.grad_clip)
+                
                 optimizer.step()
                 scheduler.step()
                 
@@ -488,11 +519,14 @@ def train(argv):
                 # Log to tensorboard
                 if step % FLAGS.log_step == 0:
                     writer.add_scalar('Loss/train', loss.item(), step)
+                    writer.add_scalar('Loss/mse', mse_loss.item(), step)
+                    writer.add_scalar('Loss/l2_reg', l2_reg.item(), step)
+                    writer.add_scalar('Loss/weighted_mse', weighted_mse.item(), step)
                     writer.add_scalar('Learning_Rate', get_lr(), step)
                 
                 # Update progress bar
                 pbar.update(1)
-                pbar.set_postfix(loss=loss.item())
+                pbar.set_postfix(loss=loss.item(), mse=mse_loss.item())
                 
                 # Generate samples and log metrics
                 if FLAGS.eval_step > 0 and step % FLAGS.eval_step == 0:
