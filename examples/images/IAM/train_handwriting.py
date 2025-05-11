@@ -49,12 +49,14 @@ flags.DEFINE_integer("embed_dim", 64, help="character embedding dimension (used 
 flags.DEFINE_float("lr", 2e-4, help="learning rate")
 flags.DEFINE_float("grad_clip", 1.0, help="gradient norm clipping")
 flags.DEFINE_integer("total_steps", 10000, help="total training steps")
-flags.DEFINE_integer("warmup", 2000, help="learning rate warmup")
-flags.DEFINE_float("lr_decay_rate", 0.9, help="learning rate decay rate (applied every lr_decay_steps)")
+flags.DEFINE_integer("warmup", 1000, help="learning rate warmup")
+flags.DEFINE_float("lr_decay_rate", 0.7, help="learning rate decay rate (applied every lr_decay_steps)")
 flags.DEFINE_integer("lr_decay_steps", 2000, help="number of steps between learning rate decay")
-flags.DEFINE_float("min_lr", 1e-6, help="minimum learning rate")
+flags.DEFINE_float("min_lr", 1e-8, help="minimum learning rate")
 flags.DEFINE_float("l2_reg_weight", 0.001, help="weight for L2 regularization of velocity field")
 flags.DEFINE_boolean("use_weighted_loss", True, help="whether to use weighted loss based on time")
+flags.DEFINE_boolean("debug", False, help="print debug information for the first few batches")
+flags.DEFINE_boolean("calculate_metrics", True, help="calculate FID and KID metrics during evaluation")
 flags.DEFINE_integer("batch_size", 32, help="batch size")
 flags.DEFINE_integer("num_workers", 4, help="workers of Dataloader")
 flags.DEFINE_float("ema_decay", 0.9999, help="ema decay rate")
@@ -122,9 +124,6 @@ def calculate_metrics(real_images, generated_images, device):
         print("Batch size too small for metrics calculation")
         return 0.0, 0.0, 0.0
     
-    # Set subset size to be smaller than batch size
-    subset_size = max(2, batch_size // 2)  # Use at least 2, or half the batch size
-    
     # Ensure images are in the right format: NCHW, uint8, [0, 255]
     real_images_uint8 = tensor_to_pil(real_images)
     generated_images_uint8 = tensor_to_pil(generated_images)
@@ -134,22 +133,39 @@ def calculate_metrics(real_images, generated_images, device):
         real_images_uint8 = real_images_uint8.repeat(1, 3, 1, 1)
         generated_images_uint8 = generated_images_uint8.repeat(1, 3, 1, 1)
     
-    # Initialize metrics with smaller subset size
+    # Initialize metrics with appropriate subset size for KID
+    # For FID we don't need a subset size
     fid = FrechetInceptionDistance(feature=64, normalize=True).to(device)
-    kid = KernelInceptionDistance(feature=64, normalize=True).to(device)
+    
+    # For KID, we need to be careful about subset size
+    # KID requires subset_size < min(n_real, n_fake)
+    # We set it to 1/3 of the batch size to be safe
+    use_kid = batch_size >= 4  # Only use KID if we have enough samples
+    if use_kid:
+        subset_size = max(2, batch_size // 3)
+        kid = KernelInceptionDistance(feature=64, normalize=True, subset_size=subset_size).to(device)
     
     # Update metrics with real and fake images
     fid.update(real_images_uint8, real=True)
     fid.update(generated_images_uint8, real=False)
     
-    kid.update(real_images_uint8, real=True)
-    kid.update(generated_images_uint8, real=False)
+    if use_kid:
+        kid.update(real_images_uint8, real=True)
+        kid.update(generated_images_uint8, real=False)
     
     # Calculate and return metrics
     try:
         fid_score = fid.compute()
-        kid_score, kid_std = kid.compute()
-        return fid_score.item(), kid_score.item(), kid_std.item()
+        
+        if use_kid:
+            try:
+                kid_score, kid_std = kid.compute()
+                return fid_score.item(), kid_score.item(), kid_std.item()
+            except Exception as e:
+                print(f"Error in KID computation: {e}")
+                return fid_score.item(), 0.0, 0.0
+        else:
+            return fid_score.item(), 0.0, 0.0
     except Exception as e:
         print(f"Error in metric computation: {e}")
         return 0.0, 0.0, 0.0
@@ -242,11 +258,12 @@ def generate_samples_for_tensorboard(model, dataset, device, num_samples, writer
         
         # Calculate and log metrics
         try:
-            fid_score, kid_score, kid_std = calculate_metrics(real_images, samples, device)
-            writer.add_scalar(f'Metrics/{model_type}/FID', fid_score, step)
-            writer.add_scalar(f'Metrics/{model_type}/KID', kid_score, step)
-            writer.add_scalar(f'Metrics/{model_type}/KID_std', kid_std, step)
-            print(f"{model_type} FID: {fid_score:.4f}, KID: {kid_score:.4f} ± {kid_std:.4f}")
+            if FLAGS.calculate_metrics:
+                fid_score, kid_score, kid_std = calculate_metrics(real_images, samples, device)
+                writer.add_scalar(f'Metrics/{model_type}/FID', fid_score, step)
+                writer.add_scalar(f'Metrics/{model_type}/KID', kid_score, step)
+                writer.add_scalar(f'Metrics/{model_type}/KID_std', kid_std, step)
+                print(f"{model_type} FID: {fid_score:.4f}, KID: {kid_score:.4f} ± {kid_std:.4f}")
         except Exception as e:
             print(f"Error calculating metrics: {e}")
     
@@ -384,6 +401,7 @@ def train(argv):
         "l2_reg_weight": FLAGS.l2_reg_weight,
         "use_weighted_loss": FLAGS.use_weighted_loss,
         "grad_clip": FLAGS.grad_clip,
+        "calculate_metrics": FLAGS.calculate_metrics,
     }
     
     # Save config to TensorBoard log directory and results directory
@@ -480,25 +498,67 @@ def train(argv):
                 x0 = torch.randn_like(images)
                 t, xt, ut = FM.sample_location_and_conditional_flow(x0, images)
                 
+                # Debug information for first few batches
+                if FLAGS.debug and step < 5:
+                    print(f"\nBatch {step} shapes:")
+                    print(f"images: {images.shape}")
+                    print(f"x0: {x0.shape}")
+                    print(f"t: {t.shape}")
+                    print(f"xt: {xt.shape}")
+                    print(f"ut: {ut.shape}")
+                    print(f"char_indices: {char_indices.shape}")
+                
                 # Forward pass
                 vt = model(t, xt, char_indices)
                 
+                if FLAGS.debug and step < 5:
+                    print(f"vt: {vt.shape}")
+                
                 # Compute loss with regularization
-                # Basic MSE loss
-                mse_loss = torch.mean((vt - ut) ** 2)
-                
-                # Add L2 regularization for the velocity field
-                l2_reg = torch.mean(vt**2) * FLAGS.l2_reg_weight
-                
-                # Add per-sample loss normalization if enabled
-                weighted_mse = 0.0
-                if FLAGS.use_weighted_loss:
-                    batch_weights = 1.0 / (torch.sum(t * (1-t), dim=1) + 1e-5)
-                    batch_weights = batch_weights / batch_weights.mean()
-                    weighted_mse = torch.mean(batch_weights * torch.mean((vt - ut) ** 2, dim=[1,2,3]))
-                    loss = weighted_mse + l2_reg
-                else:
-                    loss = mse_loss + l2_reg
+                try:
+                    # Basic MSE loss
+                    mse_loss = torch.mean((vt - ut) ** 2)
+                    
+                    # Add L2 regularization for the velocity field
+                    l2_reg = torch.mean(vt**2) * FLAGS.l2_reg_weight
+                    
+                    # Add per-sample loss normalization if enabled
+                    weighted_mse = 0.0
+                    if FLAGS.use_weighted_loss:
+                        # Check the shape of t and handle accordingly
+                        if t.dim() == 1:
+                            # For 1D time tensor
+                            batch_weights = 1.0 / (t * (1-t) + 1e-5)
+                        else:
+                            # If t has more dimensions, flatten/reshape as needed
+                            t_flat = t.view(t.size(0), -1).mean(dim=1)  # Average if needed
+                            batch_weights = 1.0 / (t_flat * (1-t_flat) + 1e-5)
+                        
+                        # Normalize weights
+                        batch_weights = batch_weights / batch_weights.mean()
+                        
+                        # Apply weights to per-sample losses
+                        # Handle different shapes of vt and ut
+                        if vt.dim() > 1 and ut.dim() > 1:
+                            # For tensor inputs, compute mean across all dimensions except batch
+                            dims = list(range(1, vt.dim()))
+                            per_sample_losses = torch.mean((vt - ut) ** 2, dim=dims)
+                        else:
+                            # For scalar inputs, just square the difference
+                            per_sample_losses = (vt - ut) ** 2
+                        
+                        weighted_mse = torch.mean(batch_weights * per_sample_losses)
+                        loss = weighted_mse + l2_reg
+                    else:
+                        loss = mse_loss + l2_reg
+                except Exception as e:
+                    print(f"Error in loss calculation at step {step}: {e}")
+                    print(f"t shape: {t.shape}, vt shape: {vt.shape}, ut shape: {ut.shape}")
+                    # Fall back to simple MSE loss
+                    loss = torch.mean((vt - ut) ** 2)
+                    mse_loss = loss
+                    l2_reg = torch.tensor(0.0, device=device)
+                    weighted_mse = torch.tensor(0.0, device=device)
                 
                 # Backward pass
                 optimizer.zero_grad()
